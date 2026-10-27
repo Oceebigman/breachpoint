@@ -96,10 +96,12 @@ export default function App() {
 
       const renderer = new BPRenderer(canvas, cfg.difficulty, cfg.botCount, cfg.team, cfg.weapon);
       renderer.onSnapshot = (s: GameSnapshot) => setSnap({ ...s });
+      renderer.setVolume(settings.volume);
       rendererRef.current = renderer;
       renderer.start();
     });
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // intentionally exclude settings — volume is applied via the separate useEffect
 
   const handleRematch = () => {
     if (!launchConfig) return;
@@ -113,6 +115,11 @@ export default function App() {
     setSnap(null);
     setScreen('menu');
   };
+
+  // Push volume changes to the renderer immediately
+  useEffect(() => {
+    rendererRef.current?.setVolume(settings.volume);
+  }, [settings.volume]);
 
   // Cleanup
   useEffect(() => {

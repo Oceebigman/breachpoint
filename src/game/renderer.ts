@@ -11,6 +11,15 @@ import {
 } from './modes';
 import { clock, bus, GamePhase } from './core';
 import { buildIrongateMap } from './world';
+import {
+  resumeAudio, updateListener, setMasterVolume, disposeAudio,
+  playGunshot, playBulletImpact, playHitMarker, playKillConfirm,
+  playDamageReceived, playPlayerDeath, playEmptyMag,
+  playReloadStart, playReloadComplete,
+  playFootstep, playJump, playLand,
+  playObjectiveBeep, playObjectiveArmed, playObjectiveDefused, playExplosion,
+  playFuseWarning, playRoundStart, playRoundEnd, playMatchEnd,
+} from './audio';
 
 // ---------- Types ----------
 
@@ -144,6 +153,13 @@ export class BPRenderer {
   // Death/respawn
   private respawnTimer = 0;
   private RESPAWN_DELAY = 4;
+
+  // Audio state tracking
+  private prevReloading = false;
+  private prevReloadTimeLeft = 0;
+  private prevGrounded = true;
+  private fuseWarnTimer = 0;
+  private prevPhase: string = '';
 
   private playerStats: PlayerStats = emptyStats();
   private playerName = 'AGENT';
@@ -361,7 +377,13 @@ export class BPRenderer {
     });
   }
 
+  /** Set master volume 0–1; wired from SettingsScreen */
+  setVolume(v: number) {
+    setMasterVolume(v);
+  }
+
   start() {
+    resumeAudio();
     clock.reset();
     const loop = (ts: number) => {
       clock.tick(ts);
@@ -375,6 +397,7 @@ export class BPRenderer {
   stop() {
     cancelAnimationFrame(this.animId);
     this.renderer.dispose();
+    disposeAudio();
   }
 
   resize() {
@@ -401,7 +424,37 @@ export class BPRenderer {
       if (ev.type === 'round_start' || ev.type === 'round_end') {
         this.respawnAll();
       }
+      if (ev.type === 'round_start') playRoundStart();
+      if (ev.type === 'round_end') {
+        const payload = ev.payload as { outcome: string } | undefined;
+        playRoundEnd(payload?.outcome === 'attackers_win');
+      }
+      if (ev.type === 'match_end') {
+        const winner = ev.payload as 0 | 1;
+        playMatchEnd(winner === this.playerTeam);
+      }
+      if (ev.type === 'objective_armed') playObjectiveArmed();
+      if (ev.type === 'objective_defused') playObjectiveDefused();
+      if (ev.type === 'objective_detonated') {
+        const obj = this.map.objectives[0];
+        playExplosion(obj ? { x: obj.position.x, y: obj.position.y, z: obj.position.z } : null);
+      }
       bus.emit(ev.type, ev.payload);
+    }
+
+    // Update 3D audio listener position each frame
+    updateListener(this.playerPos.x, this.playerPos.y, this.playerPos.z, this.playerYaw);
+
+    // Fuse warning beep when bomb armed and timer < 10s
+    const armedObj = this.matchState.objectives.find(o => o.phase === 'armed' || o.phase === 'defusing');
+    if (armedObj && armedObj.armedTimer < 10) {
+      this.fuseWarnTimer -= dt;
+      if (this.fuseWarnTimer <= 0) {
+        playFuseWarning();
+        this.fuseWarnTimer = Math.max(0.15, armedObj.armedTimer / 10); // speed up as timer drops
+      }
+    } else {
+      this.fuseWarnTimer = 0;
     }
 
     // Respawn
@@ -441,12 +494,17 @@ export class BPRenderer {
       this.bots[i] = result.bot;
 
       if (result.shotFired && result.hitId) {
+        // Spatial bot gunshot sound
+        playGunshot(b.weapon.def.id, { x: b.position.x, y: b.position.y, z: b.position.z });
+
         if (result.hitId === 'player' && this.playerAlive) {
           this.playerHealth = Math.max(0, this.playerHealth - result.hitDamage);
+          playDamageReceived();
           bus.emit('player_hit', { damage: result.hitDamage, health: this.playerHealth });
           if (this.playerHealth <= 0) {
             this.playerAlive = false;
             this.respawnTimer = this.RESPAWN_DELAY;
+            playPlayerDeath();
             this.matchState = recordKill(this.matchState, b.id, 'Bot',
               'player', this.playerName, b.weapon.def.name);
           }
@@ -520,9 +578,14 @@ export class BPRenderer {
     move.applyEuler(new THREE.Euler(0, this.playerYaw, 0));
     move.multiplyScalar(speed * dt);
 
-    // Gravity
+    // Gravity + jump/land audio
+    const wasGrounded = this.prevGrounded;
     if (!this.isGrounded) this.playerVelY -= GRAVITY * dt;
-    else if (inp.jump) { this.playerVelY = JUMP_VEL; this.isGrounded = false; }
+    else if (inp.jump) {
+      this.playerVelY = JUMP_VEL;
+      this.isGrounded = false;
+      playJump();
+    }
     else this.playerVelY = 0;
 
     move.y += this.playerVelY * dt;
@@ -533,24 +596,51 @@ export class BPRenderer {
 
     // Ground check
     this.isGrounded = resolved.y <= 0.91;
-    if (this.isGrounded) { resolved.y = 0.9; this.playerVelY = 0; }
+    if (this.isGrounded) {
+      if (!wasGrounded) playLand(Math.abs(this.playerVelY) > 6); // land sound on touchdown
+      resolved.y = 0.9;
+      this.playerVelY = 0;
+    }
+    this.prevGrounded = this.isGrounded;
 
     this.playerPos.copy(resolved);
 
-    // Weapon tick
+    // Footsteps — only when moving on ground
+    const isMovingNow = move.lengthSq() > 0.0001;
+    if (isMovingNow && this.isGrounded) {
+      playFootstep(inp.sprint, inp.crouch);
+    }
+
+    // Weapon tick — capture pre-tick reload state for reload-complete detection
+    this.prevReloading = this.playerWeapon.reloading;
+    this.prevReloadTimeLeft = this.playerWeapon.reloadTimeLeft;
     this.playerWeapon = tickWeapon(this.playerWeapon, dt);
 
-    // Reload
+    // Reload-complete detection (was reloading, now not reloading)
+    if (this.prevReloading && !this.playerWeapon.reloading) {
+      playReloadComplete();
+    }
+
+    // Reload start
     if (inp.reload) {
+      const before = this.playerWeapon.reloading;
       this.playerWeapon = tryReload(this.playerWeapon);
+      if (!before && this.playerWeapon.reloading) playReloadStart();
     }
 
     // Fire
     if (inp.fire && (this.playerWeapon.def.automatic || !this._lastFire)) {
       const isMoving = move.lengthSq() > 0.0001;
+      // Empty mag click
+      if (this.playerWeapon.ammoInMag <= 0 && !this.playerWeapon.reloading) {
+        if (!this._lastFire) playEmptyMag();
+      }
       const result = tryFire(this.playerWeapon, this.adsProgress > 0.5, isMoving);
       this.playerWeapon = result.ws;
       if (result.fired) {
+        // Player gunshot — no spatial (it's the player's own weapon)
+        playGunshot(this.playerWeapon.def.id, null);
+
         this.muzzleFlashTimer = this.playerWeapon.def.muzzleFlashDuration;
         this.recoilPitchOffset += this.playerWeapon.def.recoilPitch * (Math.PI / 180) * 0.5;
         // Apply recoil to pitch
@@ -573,7 +663,9 @@ export class BPRenderer {
 
     // Auto-reload when empty
     if (this.playerWeapon.ammoInMag === 0 && !this.playerWeapon.reloading) {
+      const before = this.playerWeapon.reloading;
       this.playerWeapon = tryReload(this.playerWeapon);
+      if (!before && this.playerWeapon.reloading) playReloadStart();
     }
 
     // Recoil pitch decay
@@ -630,14 +722,22 @@ export class BPRenderer {
       hitBot.health = Math.max(0, hitBot.health - dmg);
       this.crosshairHit = true;
       this.crosshairHitTimer = 0.15;
+      playHitMarker();
       bus.emit('hit_marker', { damage: dmg });
       if (hitBot.health <= 0) {
         hitBot.alive = false;
+        playKillConfirm();
         this.matchState = recordKill(
           this.matchState, 'player', this.playerName, hitBot.id, 'Bot', this.playerWeapon.def.name,
         );
         this.playerStats = { ...this.playerStats, kills: this.playerStats.kills + 1 };
         bus.emit('kill', { victimId: hitBot.id, weapon: this.playerWeapon.def.name });
+      }
+    } else {
+      // Bullet hit a wall — spatial impact at the ray's furthest wall point
+      if (wallDist < Infinity) {
+        const wallHitPos = eyePos.clone().addScaledVector(fireDir, wallDist);
+        playBulletImpact({ x: wallHitPos.x, y: wallHitPos.y, z: wallHitPos.z });
       }
     }
   }
@@ -658,6 +758,12 @@ export class BPRenderer {
       this.interactHoldTimer += dt;
       const objState = this.matchState.objectives.find(o => o.siteId === this.nearObjectiveSite);
       if (objState) {
+        // Beep during planting/defusing
+        const progress = objState.phase === 'planting' ? objState.progress
+          : objState.phase === 'defusing' ? Math.max(0, -objState.progress) : 0;
+        if (objState.phase === 'planting' || objState.phase === 'defusing') {
+          playObjectiveBeep(progress);
+        }
         if (this.playerTeam === 0 && (objState.phase === 'idle' || objState.phase === 'planting')) {
           this.matchState = playerInteractObjective(
             this.matchState, this.nearObjectiveSite, 'player', this.playerTeam, true, dt,
