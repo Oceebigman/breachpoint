@@ -11,6 +11,7 @@ import {
 } from './modes';
 import { clock, bus, GamePhase } from './core';
 import { buildIrongateMap } from './world';
+import { WeaponViewModel } from './weaponView';
 import {
   resumeAudio, updateListener, setMasterVolume, disposeAudio,
   playGunshot, playBulletImpact, playHitMarker, playKillConfirm,
@@ -141,8 +142,11 @@ export class BPRenderer {
   private crosshairHitTimer = 0;
   private recoilPitchOffset = 0;
 
-  // Weapon model (simple box)
-  private weaponMesh!: THREE.Mesh;
+  // Weapon view model (procedural multi-part rifle)
+  private weaponViewModel!: WeaponViewModel;
+
+  // Track movement for view-model animation
+  private _moveVec = new THREE.Vector3();
 
   // Objective markers
   private objectiveMarkers: THREE.Mesh[] = [];
@@ -188,6 +192,7 @@ export class BPRenderer {
     this.scene.add(this.camera);
 
     this.buildScene();
+    this.weaponViewModel = new WeaponViewModel(this.scene, weaponId);
     this.spawnBots(botDifficulty, botCount);
     this.setupInput();
     this.spawnPlayer();
@@ -249,10 +254,8 @@ export class BPRenderer {
       this.objectiveMarkers.push(marker);
     }
 
-    // Weapon model (view-space box)
-    const wMat = new THREE.MeshLambertMaterial({ color: 0x1a1a1a });
-    this.weaponMesh = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.35), wMat);
-    this.scene.add(this.weaponMesh);
+    // Weapon view model — built after scene lights are present
+    // (constructed in constructor after buildScene, see below)
   }
 
   private spawnBots(difficulty: BotDifficulty, count: number) {
@@ -396,6 +399,7 @@ export class BPRenderer {
 
   stop() {
     cancelAnimationFrame(this.animId);
+    this.weaponViewModel.dispose(this.scene);
     this.renderer.dispose();
     disposeAudio();
   }
@@ -611,6 +615,9 @@ export class BPRenderer {
       playFootstep(inp.sprint, inp.crouch);
     }
 
+    // Cache movement vector for view-model animation in render()
+    this._moveVec.copy(move);
+
     // Weapon tick — capture pre-tick reload state for reload-complete detection
     this.prevReloading = this.playerWeapon.reloading;
     this.prevReloadTimeLeft = this.playerWeapon.reloadTimeLeft;
@@ -619,13 +626,17 @@ export class BPRenderer {
     // Reload-complete detection (was reloading, now not reloading)
     if (this.prevReloading && !this.playerWeapon.reloading) {
       playReloadComplete();
+      this.weaponViewModel.onReloadEnd();
     }
 
     // Reload start
     if (inp.reload) {
       const before = this.playerWeapon.reloading;
       this.playerWeapon = tryReload(this.playerWeapon);
-      if (!before && this.playerWeapon.reloading) playReloadStart();
+      if (!before && this.playerWeapon.reloading) {
+        playReloadStart();
+        this.weaponViewModel.onReloadStart(this.playerWeapon.def.reloadDuration);
+      }
     }
 
     // Fire
@@ -641,6 +652,7 @@ export class BPRenderer {
         // Player gunshot — no spatial (it's the player's own weapon)
         playGunshot(this.playerWeapon.def.id, null);
 
+        this.weaponViewModel.onFire(this.playerWeapon.def.muzzleFlashDuration);
         this.muzzleFlashTimer = this.playerWeapon.def.muzzleFlashDuration;
         this.recoilPitchOffset += this.playerWeapon.def.recoilPitch * (Math.PI / 180) * 0.5;
         // Apply recoil to pitch
@@ -665,7 +677,10 @@ export class BPRenderer {
     if (this.playerWeapon.ammoInMag === 0 && !this.playerWeapon.reloading) {
       const before = this.playerWeapon.reloading;
       this.playerWeapon = tryReload(this.playerWeapon);
-      if (!before && this.playerWeapon.reloading) playReloadStart();
+      if (!before && this.playerWeapon.reloading) {
+        playReloadStart();
+        this.weaponViewModel.onReloadStart(this.playerWeapon.def.reloadDuration);
+      }
     }
 
     // Recoil pitch decay
@@ -818,14 +833,19 @@ export class BPRenderer {
     this.camera.rotation.x = this.playerPitch;
     this.camera.rotation.z = 0;
 
-    // Weapon model position (view space via camera child)
-    const wOffset = new THREE.Vector3(0.12, -0.1 - this.adsProgress * 0.06, -0.3);
-    if (this.muzzleFlashTimer > 0) wOffset.z += 0.02;
-    this.weaponMesh.position.copy(this.camera.position).add(
-      wOffset.applyEuler(this.camera.rotation),
+    // Update weapon view model
+    const moving   = this._moveVec.lengthSq() > 0.0001;
+    const sprinting = this.input.sprint && moving;
+    this.weaponViewModel.setAlive(this.playerAlive);
+    this.weaponViewModel.setAds(this.adsProgress);
+    this.weaponViewModel.update(
+      this.camera.position,
+      this.camera.rotation,
+      clock.delta,
+      moving,
+      sprinting,
+      this.isCrouching,
     );
-    this.weaponMesh.rotation.copy(this.camera.rotation);
-    this.weaponMesh.visible = this.playerAlive;
 
     this.renderer.render(this.scene, this.camera);
   }
